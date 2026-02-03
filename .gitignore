@@ -1,0 +1,14 @@
+# Ympäristömuuttujat (SISÄLTÄÄ API-AVAIMEN)
+.env
+
+# Virtuaaliympäristö
+.venv/
+venv/
+env/
+
+# Pythonin välimuistitiedostot
+__pycache__/
+*.py[cod]
+
+# VS Coden asetukset (vapaaehtoinen)
+.vscode/
