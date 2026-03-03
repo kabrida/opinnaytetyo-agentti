@@ -3,7 +3,6 @@
 # https://www.gradio.app/guides/creating-a-chatbot-fast
 
 
-from pyexpat.errors import messages
 from dotenv import load_dotenv
 import os
 from google import genai
