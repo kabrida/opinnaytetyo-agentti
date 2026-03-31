@@ -9,9 +9,11 @@
 # Vaihe 5: Vastaus Gemini-mallilla, joka käyttää retrieval-kontekstia
 
 import os
+import re
 import time
-import uuid
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import date
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -53,17 +55,25 @@ PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "all-pdf-files")
 FORCE_REINDEX = os.getenv("FORCE_REINDEX", "false").lower() == "true"
 
 # Kuinka monta hakutulosta palautetaan retrieval-vaiheessa.
-TOP_K = 5
+TOP_K = 3
+
+# Jos vastaus kestää tätä pidempään, käyttäjälle näytetään viivehuomio.
+SLOW_RESPONSE_THRESHOLD_SECONDS = 10.0
+
+# Aikakatkaisut verkkokutsuille, jotta sovellus ei jää odottamaan loputtomasti.
+RETRIEVAL_TIMEOUT_SECONDS = float(os.getenv("RETRIEVAL_TIMEOUT_SECONDS", "8"))
+GENERATION_TIMEOUT_SECONDS = float(os.getenv("GENERATION_TIMEOUT_SECONDS", "20"))
+STARTUP_TIMEOUT_SECONDS = float(os.getenv("STARTUP_TIMEOUT_SECONDS", "25"))
 
 # Testikysymys retrieval-vaiheelle.
-TEST_QUERY = "Mitä Multi Basic tarkoittaa ja kenelle se on tarkoitettu?"
+TEST_QUERY = "Mikä kamppis nyt on voimassa?"
 
 # Generointimallit järjestyksessä: ensin kokeillaan 2.5-flashia,
 # ja jos se epäonnistuu (quota/permission/not found), kokeillaan seuraavia.
 GENERATION_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3-flash"
 ]
 
 # System-prompt, joka pakottaa mallin pysymään annetussa kontekstissa.
@@ -72,11 +82,89 @@ Olet avulias optisen alan asiantuntija.
 Vastaa käyttäjän kysymykseen VAIN annetun kontekstin perusteella.
 Jos tietoa ei löydy kontekstista, sano se suoraan äläkä arvaa.
 Vastaa suomeksi.
-Lisää loppuun lyhyt rivi: 'Lähteet: ...' jossa on sivunumerot ja lähdetiedostot.
+Jos kysymys liittyy esimerkiksi kampanjan voimassaoloon tai ajankohtaan,
+hyödynnä myös annettua tämän päivän päivämäärää.
+Lisää loppuun lyhyt rivi: 'Lähteet: ...' jossa on lähdetiedosto sekä sivunumero kyseisessä tiedostossa.
 """.strip()
 
 # Pidetään index-instanssi muistissa Gradio-kutsuja varten.
 GLOBAL_INDEX = None
+
+# Puhekielen normalisointisäännöt retrieval-kyselylle.
+# Ideana on muuntaa yleisiä puhekielen termejä hieman muodollisempaan muotoon,
+# jotta dokumenttihaku osuu paremmin myös ilman tarkkoja teknisiä sanoja.
+SPOKEN_QUERY_RULES: list[tuple[str, str]] = [
+    (r"\bkamppis\b|\bkampis\b|\bkampanjaa\b", "kampanja tarjous"),
+    (r"\bsoppari\b|\bsopparii\b", "sopimus"),
+    (r"\bonks\b|\bonksko\b|\bonkoos\b", "onko"),
+    (r"\bmeiä\b|\bmeijän\b|\bmeidän\b", "meidän"),
+    (r"\byrityksel\b", "yrityksellä"),
+]
+
+
+def run_with_timeout(func, timeout_seconds: float, error_context: str, *args, **kwargs):
+    """
+    Suorittaa funktion aikakatkaisun kanssa.
+
+    Tätä käytetään erityisesti verkkoa käyttäviin kutsuihin,
+    jotta sovellus ei jää jumiin verkkokatkon aikana.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func, *args, **kwargs)
+
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError as error:
+        future.cancel()
+        raise TimeoutError(
+            f"{error_context} aikakatkaistiin ({timeout_seconds:.0f}s)."
+        ) from error
+    finally:
+        # wait=False varmistaa, ettei käyttöliittymä jää odottamaan taustasäiettä.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def format_user_friendly_error(error: Exception) -> str:
+    """
+    Muuntaa teknisen virheen käyttäjälle selkeäksi suomenkieliseksi viestiksi.
+    """
+    message = str(error).lower()
+
+    is_timeout = (
+        isinstance(error, TimeoutError)
+        or "timeout" in message
+        or "timed out" in message
+        or "aikakatka" in message
+    )
+    if is_timeout:
+        return "Aikakatkaisu: palvelu ei vastannut ajoissa. Tarkista verkkoyhteys ja yritä uudelleen."
+
+    is_connection_error = (
+        "connection" in message
+        or "network" in message
+        or "dns" in message
+        or "getaddrinfo" in message
+        or "11001" in message
+        or "name resolution" in message
+        or "temporary failure in name resolution" in message
+        or "max retries exceeded" in message
+        or "failed to establish a new connection" in message
+        or "ssl" in message
+        or "proxy" in message
+    )
+    if is_connection_error:
+        return "Yhteysvirhe: palveluun ei saatu yhteyttä. Tarkista verkkoyhteys ja yritä uudelleen."
+
+    is_auth_error = (
+        "401" in message
+        or "unauthorized" in message
+        or "api key" in message
+        or "authentication" in message
+    )
+    if is_auth_error:
+        return "Tunnistautumisvirhe: tarkista API-avaimet (.env)."
+
+    return f"Odottamaton virhe: {error}"
 
 # ==================== VAIHE 1: TEKSTIN EKSTRAKTIO ====================
 
@@ -347,6 +435,26 @@ def retrieve_context(index, question: str, top_k: int = TOP_K) -> list[dict]:
     return matches
 
 
+def normalize_spoken_query(question: str) -> str:
+    """
+    Muuntaa puhekielistä kysymystä retrievalille paremmin sopivaan muotoon.
+
+    Huom: Tämä ei muuta käyttäjälle näytettävää kysymystä,
+    vaan ainoastaan Pinecone-hakua varten käytettävää versiota.
+    """
+    normalized = question.strip().lower()
+
+    for pattern, replacement in SPOKEN_QUERY_RULES:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+
+    # Tiivistetään ylimääräiset välilyönnit.
+    normalized = " ".join(normalized.split())
+
+    # Lisätään alkuperäinen kysymys mukaan retrieval-tekstiin,
+    # jotta mahdolliset erisnimet (esim. yrityksen nimi) säilyvät varmasti mukana.
+    return f"{normalized} | alkuperäinen: {question.strip()}"
+
+
 def print_retrieval_results(question: str, matches: list[dict]) -> None:
     """
     Tulostaa retrieval-haun tulokset selkeästi.
@@ -386,7 +494,10 @@ def generate_answer(question: str, matches: list[dict]) -> str:
 
     context_text = "\n\n---\n\n".join(context_blocks)
 
+    today_fi = date.today().strftime("%d.%m.%Y")
+
     user_prompt = (
+        f"Tänään on {today_fi}.\n\n"
         f"Konteksti:\n{context_text}\n\n"
         f"Kysymys: {question}\n\n"
         "Vastaa kontekstin perusteella selkeästi ja käytännöllisesti."
@@ -500,13 +611,40 @@ def rag_chat(message, history):
     if GLOBAL_INDEX is None:
         return "Index-yhteyttä ei ole alustettu. Käynnistä sovellus uudelleen."
 
+    start_time = time.perf_counter()
+
     try:
-        matches = retrieve_context(GLOBAL_INDEX, message.strip(), top_k=TOP_K)
+        retrieval_query = normalize_spoken_query(message.strip())
+        matches = run_with_timeout(
+            retrieve_context,
+            RETRIEVAL_TIMEOUT_SECONDS,
+            "Hakuvaihe",
+            GLOBAL_INDEX,
+            retrieval_query,
+            top_k=TOP_K,
+        )
         if not matches:
-            return "En löytänyt sopivaa tietoa dokumenteista tähän kysymykseen."
-        return generate_answer(message.strip(), matches)
+            answer = "En löytänyt sopivaa tietoa dokumenteista tähän kysymykseen."
+        else:
+            answer = run_with_timeout(
+                generate_answer,
+                GENERATION_TIMEOUT_SECONDS,
+                "Vastausvaihe",
+                message.strip(),
+                matches,
+            )
+
+        elapsed = time.perf_counter() - start_time
+        if elapsed > SLOW_RESPONSE_THRESHOLD_SECONDS:
+            delay_note = (
+                f"⏳ Vasteaika oli {elapsed:.1f} s (yli {SLOW_RESPONSE_THRESHOLD_SECONDS:.0f} s). "
+                "Vastaus saatiin valmiiksi, mutta haku/mallivastaus oli tavallista hitaampi.\n\n"
+            )
+            return delay_note + answer
+
+        return answer
     except Exception as error:
-        return f"Tapahtui virhe haussa/vastauksessa: {error}"
+        return format_user_friendly_error(error)
 
 
 def launch_gradio_app() -> None:
@@ -518,9 +656,9 @@ def launch_gradio_app() -> None:
         title="Optikko RAG Chat (text-only)",
         description="Kysyy vastaukset data-kansion PDF-tiedostoista Pinecone-retrievalin kautta.",
         examples=[
-            "Mitä Multi Basic tarkoittaa ja kenelle se on tarkoitettu?",
+            "Mikä kampanja on tällä hetkellä voimassa?",
+            "Kuinka paljon ohennetut linssit maksavat?",
             "Mitä eroa on Multi Plus ja Multi Comfort -linssien välillä?",
-            "Mitä moniteholinsseistä kerrotaan yleisesti?",
         ],
     )
     interface.launch()
@@ -541,13 +679,27 @@ def main():
 
     index = None
     try:
-        index = connect_to_pinecone_index()
+        index = run_with_timeout(
+            connect_to_pinecone_index,
+            STARTUP_TIMEOUT_SECONDS,
+            "Pinecone-yhteyden alustus",
+        )
         print(f"Yhteys Pinecone-indexiin onnistui: {PINECONE_INDEX_NAME}")
     except Exception as error:
-        print(f"Pinecone-yhteystesti epäonnistui: {error}")
+        print(f"Pinecone-yhteystesti epäonnistui: {format_user_friendly_error(error)}")
         return
 
-    total_vectors = ensure_index_has_all_pdfs(index)
+    try:
+        total_vectors = run_with_timeout(
+            ensure_index_has_all_pdfs,
+            STARTUP_TIMEOUT_SECONDS,
+            "Indeksointi",
+            index,
+        )
+    except Exception as error:
+        print(f"Indeksointi epäonnistui: {format_user_friendly_error(error)}")
+        return
+
     if total_vectors <= 0:
         print("Indexissä ei ole vektoreita. Sovellusta ei käynnistetä.")
         return
@@ -558,11 +710,34 @@ def main():
 
     # Pieni smoke test ennen UI:ta.
     print("\n=== RETRIEVAL SMOKE TEST ===")
-    matches = retrieve_context(index, TEST_QUERY, top_k=TOP_K)
+    smoke_query = normalize_spoken_query(TEST_QUERY)
+    try:
+        matches = run_with_timeout(
+            retrieve_context,
+            RETRIEVAL_TIMEOUT_SECONDS,
+            "Smoke test retrieval",
+            index,
+            smoke_query,
+            top_k=TOP_K,
+        )
+    except Exception as error:
+        print(f"Smoke test retrieval epäonnistui: {format_user_friendly_error(error)}")
+        matches = []
+
     print_retrieval_results(TEST_QUERY, matches)
 
     print("\n=== GROUNDED ANSWER SMOKE TEST ===")
-    print(generate_answer(TEST_QUERY, matches))
+    try:
+        smoke_answer = run_with_timeout(
+            generate_answer,
+            GENERATION_TIMEOUT_SECONDS,
+            "Smoke test vastaus",
+            TEST_QUERY,
+            matches,
+        )
+        print(smoke_answer)
+    except Exception as error:
+        print(f"Smoke test vastaus epäonnistui: {format_user_friendly_error(error)}")
 
     print("\n=== GRADIO KÄYNNISTETÄÄN ===")
     launch_gradio_app()
