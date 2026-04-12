@@ -56,7 +56,41 @@ Tämä projekti on opinnäytetyöhön liittyvä tekoälypohjainen chatbot-kokeil
 - Jos aineisto muuttuu, voit pakottaa uudelleenindeksoinnin:
   - aseta `.env`: `FORCE_REINDEX=true`, aja kerran, palauta sen jälkeen `false`.
 
-## Tiedossa olevat puutteet / jatkokehitys
-- Keskusteluhistorian hyödyntäminen monivuoroisessa chatissa (stateful context).
-- Virheellisen tai vanhentuneen datan hallinta (esim. vanhat kampanjat/sopimukset).
-- Kehysdatan lisääminen kokonaishinnan laskentaa varten.
+## Testaus
+
+### 1) Offline-testit (suositus päivittäiseen käyttöön)
+- Ei kuluta Gemini/Pinecone-kiintiötä.
+- Aja:
+	- `python -m pytest -q`
+
+### 2) Live retrieval -arviointi (kuluttaa embedding-kutsuja)
+- Tiedosto: `tests/test_live_eval.py` (markeri: `live_retrieval`)
+- Kultadata: `tests/retrieval_goldens.json`
+- Ota yksittäisiä kysymyksiä käyttöön asettamalla `enabled=true`.
+- Aja:
+	- PowerShell: `$env:RUN_LIVE_RETRIEVAL_TESTS='true'; python -m pytest -m live_retrieval -q`
+
+Lisäasetukset:
+- `LIVE_RETRIEVAL_TOP_K` (oletus: `TOP_K`)
+- `LIVE_RETRIEVAL_MIN_RECALL` (oletus: `0.65`)
+
+Retrieval-kynnyksen kalibrointi (useita score-rajoja yhdellä ajolla):
+- Tiedosto: `tests/test_live_retrieval_calibration.py` (markeri: `live_retrieval_calibration`)
+- Aja:
+	- PowerShell: `$env:RUN_LIVE_RETRIEVAL_CALIBRATION='true'; $env:LIVE_RETRIEVAL_TOP_K='6'; $env:LIVE_RETRIEVAL_THRESHOLDS='0.45,0.50,0.55,0.60,0.65,0.70'; python -m pytest -m live_retrieval_calibration -s -q`
+
+Lisäasetukset:
+- `LIVE_RETRIEVAL_THRESHOLDS` (pilkulla erotellut raja-arvot)
+
+### 3) Live E2E smoke (kuluttaa embedding + generation)
+- Tiedosto: `tests/test_live_eval.py` (markeri: `live_e2e`)
+- Aja:
+	- PowerShell: `$env:RUN_LIVE_E2E_TESTS='true'; python -m pytest -m live_e2e -q`
+
+Lisäasetus:
+- `LIVE_E2E_QUERY` (oletus: `Mikä kampanja on tällä hetkellä voimassa?`)
+
+### Kiintiöystävällinen suositus
+- Aja offline-testit aina.
+- Aja `live_retrieval` tarvittaessa (esim. 10-50 kysymystä).
+- Aja `live_e2e` vain muutamalla smoke-kysymyksellä per päivä.

@@ -1,0 +1,121 @@
+[
+  {
+    "enabled": true,
+    "question": "Mikä on Kevättarjouksen kampanja-aika vuonna 2026?",
+    "expected_source_contains": "kampanjaohje_kevattarjous_2026",
+    "expected_page": 1,
+    "notes": "Yksiselitteinen haku Kevättarjous-dokumenttiin."
+  },
+  {
+    "enabled": true,
+    "question": "Mikä on Talvitarjouksen kampanja-aika?",
+    "expected_source_contains": "kampanjaohje_talvitarjous",
+    "expected_page": 1,
+    "notes": "Yksiselitteinen haku Talvitarjous-dokumenttiin."
+  },
+  {
+    "enabled": true,
+    "question": "Mikä alennus erikoisryhmille myönnetään jatkuvissa eduissa?",
+    "expected_source_contains": "jatkuvat_edut_ja_erikoisryhmat",
+    "expected_page": 1,
+    "notes": "Kysymys kohdistuu jatkuviin etuihin ja erikoisryhmiin."
+  },
+  {
+    "enabled": true,
+    "question": "Mikä on Classic Vision -kehysmerkin hinta?",
+    "expected_source_contains": "kehyshinnasto",
+    "expected_page": 1,
+    "notes": "Kehyshinnasto-taulukon hintatieto."
+  },
+  {
+    "enabled": true,
+    "question": "Mikä on Premium Selection -kehysten hinta?",
+    "expected_source_contains": "kehyshinnasto",
+    "expected_page": 1,
+    "notes": "Toinen kehystaulukon tarkistus eri riviltä."
+  },
+  {
+    "enabled": true,
+    "question": "Mikä on Single 5 Basic -linssin hinta per pari?",
+    "expected_source_contains": "linssihinnasto",
+    "expected_page": 1,
+    "notes": "Linssihinnaston yksitehorivin hintatieto."
+  },
+  {
+    "enabled": true,
+    "question": "Mitä pinnoitteita Single 5 Plus -linssiin sisältyy?",
+    "expected_source_contains": "linssihinnasto",
+    "expected_page": 1,
+    "notes": "Linssihinnaston pinnoitetieto."
+  },
+  {
+    "enabled": true,
+    "question": "Mikä tiedosto sisältää yritysten Y-tunnukset ja tiedon suojalaseista?",
+    "expected_source_contains": "yrityssopimukset_2026",
+    "expected_page": 1,
+    "notes": "Yrityssopimusten taulukkosisältö."
+  },
+  {
+    "enabled": false,
+    "question": "Mitä sisältöalueita tuotekuvaston sisällysluettelossa mainitaan?",
+    "expected_source_contains": "tuotekuvasto",
+    "expected_page": 1,
+    "notes": "Jätä aluksi pois, jos OCR/sisällysluetteloteksti on heikosti luettavissa."
+  },
+  {
+    "enabled": false,
+    "question": "Mitkä jatkuvat edut eivät ole sidottuja kampanja-aikaan?",
+    "expected_source_contains": "jatkuvat_edut_ja_erikoisryhmat",
+    "expected_page": 1,
+    "notes": "Ota käyttöön, kun haluat testata pidemmän tekstin semanttista osuvuutta."
+  },
+  {
+    "enabled": true,
+    "question": "Mikä tarjous on tällä hetkellä voimassa?",
+    "expected_source_contains": "kampanjaohje_kevattarjous_2026",
+    "expected_page": 1,
+    "notes": "Nykyhetken tarjouskysymys, odotuksena Kevättarjous 2026."
+  },
+  {
+    "enabled": true,
+    "question": "Kuinka paljon opiskelija-alennus on?",
+    "expected_source_contains": "jatkuvat_edut_ja_erikoisryhmat",
+    "expected_page": 1,
+    "notes": "Odotettu tieto: -15 % (jatkuvat edut, sivu 1)."
+  },
+  {
+    "enabled": true,
+    "question": "Onko yritykselle Vartiointi Hovi sopimusta?",
+    "expected_source_contains": "yrityssopimukset_2026",
+    "expected_page": 1,
+    "notes": "Odotettu vastaus: kyllä (yrityssopimukset, sivu 1)."
+  },
+  {
+    "enabled": true,
+    "question": "Kuuluuko yritykselle Sairaala AB suojalasit sopimukselle?",
+    "expected_source_contains": "yrityssopimukset_2026",
+    "expected_page": 2,
+    "notes": "Odotettu vastaus: kyllä (yrityssopimukset, sivu 2)."
+  },
+  {
+    "enabled": false,
+    "question": "Asiakas haluaa kahdet silmälasit: molemmissa Trendi-kehykset ja yksitehot, toisessa lisäksi polarisointi. Mikä on loppusumma kampanjalla?",
+    "expected_sources_contains": [
+      "kampanjaohje_kevattarjous_2026",
+      "linssihinnasto",
+      "kehyshinnasto"
+    ],
+    "expected_page": null,
+    "notes": "Monilähdetapaus: odotettu laskettu tulos 459 €. Ota käyttöön, kun LIVE_RETRIEVAL_TOP_K on riittävän suuri (esim. 6-8)."
+  },
+  {
+    "enabled": false,
+    "question": "Saako polarisoinnin kolmesti ohennettuun linssiin?",
+    "expected_sources_contains": [
+      "linssihinnasto",
+      "tuotekuvasto"
+    ],
+    "expected_page": null,
+    "notes": "Monilähde validointi: odotettu vastaus ei. Ota käyttöön, kun haluat testata ristiviittausta kahden dokumentin välillä."
+  }
+]

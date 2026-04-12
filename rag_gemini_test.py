@@ -55,7 +55,13 @@ PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "all-pdf-files")
 FORCE_REINDEX = os.getenv("FORCE_REINDEX", "false").lower() == "true"
 
 # Kuinka monta hakutulosta palautetaan retrieval-vaiheessa.
-TOP_K = 3
+TOP_K = 5
+
+# Minimi-osuvuus retrieval-osumalle. Tätä heikommat osumat hylätään.
+RETRIEVAL_SCORE_THRESHOLD = float(os.getenv("RETRIEVAL_SCORE_THRESHOLD", "0.65"))
+
+# Kuinka monta viimeisintä keskusteluvuoroa annetaan mallille kontekstiksi.
+HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "6"))
 
 # Jos vastaus kestää tätä pidempään, käyttäjälle näytetään viivehuomio.
 SLOW_RESPONSE_THRESHOLD_SECONDS = 10.0
@@ -100,6 +106,20 @@ SPOKEN_QUERY_RULES: list[tuple[str, str]] = [
     (r"\bmeiä\b|\bmeijän\b|\bmeidän\b", "meidän"),
     (r"\byrityksel\b", "yrityksellä"),
 ]
+
+# Kevyt estolista selvästi haitallisille tai palvelun tarkoituksen vastaisille pyynnöille.
+# Tämä ei korvaa mallin omaa turvallisuutta, mutta estää ilmeisimmät tapaukset jo ennen retrievalia.
+DISALLOWED_QUERY_PATTERNS: list[str] = [
+    r"\bpommi\b|\bräjähde\b|\brjähde\b|\bexplosive\b|\bbomb\b",
+    r"\bampua\b|\base\b|\baseet\b|\bweapon\b|\bgun\b",
+    r"\bhuume\b|\bnark\w*\b|\bdrug\b|\bcocaine\b|\bkokaiini\b",
+    r"\bhakker\w*\b|\bhack\w*\b|\bphishing\b|\bmalware\b|\bransomware\b",
+    r"\btapa\b|\btappaa\b|\bmurha\b|\bkill\b|\bmurder\b",
+]
+
+DISALLOWED_QUERY_MESSAGE = (
+    "En voi auttaa tässä pyynnössä. Voin auttaa optisen alan dokumentteihin liittyvissä kysymyksissä."
+)
 
 
 def run_with_timeout(func, timeout_seconds: float, error_context: str, *args, **kwargs):
@@ -191,6 +211,9 @@ def extract_text_chunks(pdf_path: str, max_chunk_size: int = TEXT_CHUNK_MAX_SIZE
         Lista chunkeja tiedoitaan
     """
     # Avataan PDF käyttäen PyMuPDF:ää (fitz)
+    # PoC-rajauksena luetaan vain raakateksti.
+    # Jatkokehitys: taulukot voidaan myöhemmin lukea rakenteisesti (esim. taulukkorivitasolla),
+    # jotta monimutkaisten PDF-taulukoiden numeerinen tulkinta paranee.
     doc = fitz.open(pdf_path)
     chunks = []
 
@@ -455,6 +478,21 @@ def normalize_spoken_query(question: str) -> str:
     return f"{normalized} | alkuperäinen: {question.strip()}"
 
 
+def is_disallowed_query(question: str) -> bool:
+    """
+    Tunnistaa yksinkertaisilla regex-säännöillä pyynnöt, joita ei käsitellä.
+    """
+    text = question.strip().lower()
+    if not text:
+        return False
+
+    for pattern in DISALLOWED_QUERY_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return True
+
+    return False
+
+
 def print_retrieval_results(question: str, matches: list[dict]) -> None:
     """
     Tulostaa retrieval-haun tulokset selkeästi.
@@ -473,7 +511,77 @@ def print_retrieval_results(question: str, matches: list[dict]) -> None:
         print(f"{preview}...")
 
 
-def generate_answer(question: str, matches: list[dict]) -> str:
+def filter_matches_by_score(matches: list[dict], min_score: float = RETRIEVAL_SCORE_THRESHOLD) -> list[dict]:
+    """
+    Suodattaa retrieval-osumat minimi-osuvuuden perusteella.
+    """
+    return [m for m in matches if float(m.get("score", 0.0)) >= min_score]
+
+
+def build_sources_line(matches: list[dict]) -> str:
+    """
+    Rakentaa standardoidun lähderivin uniikeista lähteistä.
+    """
+    unique_sources: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in matches:
+        source = str(item.get("source", "")).strip() or "tuntematon"
+        page = str(item.get("page", "?")).strip() or "?"
+        key = (source, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_sources.append(f"{source} (s.{page})")
+
+    if not unique_sources:
+        return "Lähteet: ei saatavilla"
+
+    return "Lähteet: " + ", ".join(unique_sources)
+
+
+def format_history_for_prompt(history, max_turns: int = HISTORY_MAX_TURNS) -> str:
+    """
+    Muuntaa Gradio-historian tiiviiksi tekstiksi promptiin.
+
+    Tukee kahta yleistä formaattia:
+    - type="messages": [{"role": "user"|"assistant", "content": ...}, ...]
+    - oletusformaatti: [(user_text, assistant_text), ...]
+    """
+    if not history:
+        return ""
+
+    lines: list[str] = []
+
+    # Viimeisimmät vuorot riittävät jatkokysymysten tulkintaan.
+    recent_history = history[-max_turns:] if isinstance(history, list) else []
+
+    for entry in recent_history:
+        if isinstance(entry, dict):
+            role = str(entry.get("role", "")).strip().lower()
+            content = str(entry.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "user":
+                lines.append(f"Käyttäjä: {content}")
+            elif role == "assistant":
+                lines.append(f"Avustaja: {content}")
+            else:
+                lines.append(f"Viesti: {content}")
+            continue
+
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            user_text = str(entry[0]).strip() if entry[0] is not None else ""
+            assistant_text = str(entry[1]).strip() if entry[1] is not None else ""
+            if user_text:
+                lines.append(f"Käyttäjä: {user_text}")
+            if assistant_text:
+                lines.append(f"Avustaja: {assistant_text}")
+
+    return "\n".join(lines)
+
+
+def generate_answer(question: str, matches: list[dict], history=None) -> str:
     """
     Muodostaa lopullisen vastauksen retrieval-hakutulosten pohjalta.
 
@@ -487,21 +595,35 @@ def generate_answer(question: str, matches: list[dict]) -> str:
     if not matches:
         return "En löytänyt riittävää tietoa dokumenteista tähän kysymykseen."
 
+    sources_line = build_sources_line(matches)
+
     context_blocks = []
     for i, item in enumerate(matches, start=1):
         source_label = f"[Lähde {i}: sivu {item['page']}, tiedosto {item['source']}]"
         context_blocks.append(f"{source_label}\n{item['content']}")
 
     context_text = "\n\n---\n\n".join(context_blocks)
+    history_text = format_history_for_prompt(history, max_turns=HISTORY_MAX_TURNS)
 
     today_fi = date.today().strftime("%d.%m.%Y")
 
-    user_prompt = (
-        f"Tänään on {today_fi}.\n\n"
-        f"Konteksti:\n{context_text}\n\n"
-        f"Kysymys: {question}\n\n"
-        "Vastaa kontekstin perusteella selkeästi ja käytännöllisesti."
-    )
+    if history_text:
+        user_prompt = (
+            f"Tänään on {today_fi}.\n\n"
+            f"Aiempi keskustelu:\n{history_text}\n\n"
+            f"Konteksti:\n{context_text}\n\n"
+            f"Uusin kysymys: {question}\n\n"
+            "Hyödynnä aiempi keskustelu vain silloin, kun se auttaa tulkitsemaan uusinta kysymystä. "
+            "Faktat on kuitenkin otettava vain annetusta kontekstista. "
+            "Vastaa kontekstin perusteella selkeästi ja käytännöllisesti."
+        )
+    else:
+        user_prompt = (
+            f"Tänään on {today_fi}.\n\n"
+            f"Konteksti:\n{context_text}\n\n"
+            f"Kysymys: {question}\n\n"
+            "Vastaa kontekstin perusteella selkeästi ja käytännöllisesti."
+        )
 
     last_error = None
 
@@ -519,7 +641,9 @@ def generate_answer(question: str, matches: list[dict]) -> str:
             )
             answer_text = (response.text or "").strip()
             if answer_text:
-                return f"(Malli: {model_name})\n\n{answer_text}"
+                if "lähteet:" not in answer_text.lower():
+                    answer_text = f"{answer_text}\n\n{sources_line}"
+                return answer_text
         except Exception as error:
             last_error = error
             message = str(error).lower()
@@ -603,15 +727,17 @@ def rag_chat(message, history):
     1) hakee top-k osumat Pineconesta
     2) muodostaa grounded-vastauksen
     """
-    del history
-
     if not message or not message.strip():
         return "Kirjoita kysymys ensin."
 
+    start_time = time.perf_counter()
+
+    if is_disallowed_query(message):
+        elapsed = time.perf_counter() - start_time
+        return f"{DISALLOWED_QUERY_MESSAGE}\n\nVasteaika: {elapsed:.1f} s"
+
     if GLOBAL_INDEX is None:
         return "Index-yhteyttä ei ole alustettu. Käynnistä sovellus uudelleen."
-
-    start_time = time.perf_counter()
 
     try:
         retrieval_query = normalize_spoken_query(message.strip())
@@ -623,6 +749,10 @@ def rag_chat(message, history):
             retrieval_query,
             top_k=TOP_K,
         )
+
+        # Hylätään heikot osumat, jotta vastaus nojaa vain riittävän osuviin lähteisiin.
+        matches = filter_matches_by_score(matches, min_score=RETRIEVAL_SCORE_THRESHOLD)
+
         if not matches:
             answer = "En löytänyt sopivaa tietoa dokumenteista tähän kysymykseen."
         else:
@@ -632,17 +762,20 @@ def rag_chat(message, history):
                 "Vastausvaihe",
                 message.strip(),
                 matches,
+                history,
             )
 
         elapsed = time.perf_counter() - start_time
-        if elapsed > SLOW_RESPONSE_THRESHOLD_SECONDS:
-            delay_note = (
-                f"⏳ Vasteaika oli {elapsed:.1f} s (yli {SLOW_RESPONSE_THRESHOLD_SECONDS:.0f} s). "
-                "Vastaus saatiin valmiiksi, mutta haku/mallivastaus oli tavallista hitaampi.\n\n"
-            )
-            return delay_note + answer
+        response_time_line = f"\n\nVasteaika: {elapsed:.1f} s"
 
-        return answer
+        if elapsed > SLOW_RESPONSE_THRESHOLD_SECONDS:
+            slow_note = (
+                f"\n\nHuom: vasteaika ylitti {SLOW_RESPONSE_THRESHOLD_SECONDS:.0f} s rajan, "
+                "joten haku tai mallivastaus oli tavallista hitaampi."
+            )
+            return answer + response_time_line + slow_note
+
+        return answer + response_time_line
     except Exception as error:
         return format_user_friendly_error(error)
 
